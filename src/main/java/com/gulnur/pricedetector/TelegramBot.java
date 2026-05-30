@@ -39,7 +39,7 @@ private PriceTrackerService priceTrackerService;
 
             // 🕵️‍♂️ 1. İhtimal: Selamlaşma
             if (messageText.equalsIgnoreCase("/start") || messageText.equalsIgnoreCase("Hello")) {
-                message.setText("Hi! Price Detector is ready! 🕵️‍♀️💖\nCommands:\n/track [url] - Start tracking a product\n/list - List your tracked products");
+                message.setText("Hi! Price Detector is ready! 🕵️‍♀️💖\nCommands:\n/track [url] - Start tracking a product\n/list - List your tracked products\n/check - Manual price check for all tracked products\n/testnotification - Test if notifications work");
                 gonder(message);
             } 
             // 🔗 2. İhtimal: Track komutu
@@ -70,6 +70,38 @@ private PriceTrackerService priceTrackerService;
                     message.setText(sb.toString());
                 }
                 gonder(message);
+            }
+            // 🔎 3.1. İhtimal: Manuel kontrol komutu
+            else if (messageText.equalsIgnoreCase("/check")) {
+                message.setText("🔍 Checking prices for your products... ⏳");
+                gonder(message);
+                priceTrackerService.checkPricesForUser(chatId);
+                message.setText("✅ Price check complete! If any drop was found, you received a notification.");
+                gonder(message);
+            }
+            // 🔔 3.2. İhtimal: Test bildirimi
+            else if (messageText.equalsIgnoreCase("/testnotification")) {
+                message.setText("🔔 Test notification coming in 3... 2... 1...");
+                gonder(message);
+                
+                SendMessage testMsg = new SendMessage();
+                testMsg.setChatId(String.valueOf(chatId));
+                testMsg.setText("🎉 **TEST BAŞARILI!** 🎉\n\nBildirimler düzgün çalışıyor. İndirim yakaladığımızda işte böyle görünecek! 🚀");
+                testMsg.setParseMode("Markdown");
+                gonder(testMsg);
+            }
+            // 🧪 3.3. İhtimal: Simüle indirim (Test için)
+            else if (messageText.startsWith("/simulatedrop")) {
+                String[] parts = messageText.split(" ");
+                if (parts.length > 1) {
+                    String url = parts[1];
+                    message.setText("🧪 Simulating a price drop for: " + url + "...");
+                    gonder(message);
+                    priceTrackerService.simulatePriceDropNotification(url, chatId);
+                } else {
+                    message.setText("Please provide a URL to simulate: /simulatedrop [url]");
+                    gonder(message);
+                }
             }
             // 🔗 4. İhtimal: Sadece link atıldı (Hızlı kontrol)
             else if (messageText.startsWith("http")) {

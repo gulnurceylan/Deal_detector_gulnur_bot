@@ -7,6 +7,10 @@ import org.openqa.selenium.chrome.ChromeDriver;
 import org.openqa.selenium.chrome.ChromeOptions;
 import org.springframework.stereotype.Service;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 
@@ -20,15 +24,37 @@ public class PriceScraper {
         WebDriver driver = null;
         try {
             io.github.bonigarcia.wdm.WebDriverManager.chromedriver().setup();
+            String originalDriverPath = System.getProperty("webdriver.chrome.driver");
+            if (originalDriverPath != null) {
+                File originalFile = new File(originalDriverPath);
+                File tempDir = new File(System.getProperty("java.io.tmpdir"));
+                File patchedFile = new File(tempDir, "chromedriver_patched_" + originalFile.getName() + "_" + originalFile.length());
+                if (patchedFile.exists()) {
+                    patchedFile.delete();
+                }
+                try {
+                    patchChromeDriver(originalFile, patchedFile);
+                } catch (Exception e) {
+                    System.out.println("[Debug] Failed to patch chromedriver: " + e.getMessage());
+                }
+                if (patchedFile.exists()) {
+                    System.setProperty("webdriver.chrome.driver", patchedFile.getAbsolutePath());
+                }
+            }
 
             ChromeOptions options = new ChromeOptions();
-            options.addArguments("--headless=new"); 
+            if (!url.contains("hm.com")) {
+                options.addArguments("--headless=new"); 
+            }
             options.addArguments("--disable-gpu");
             options.addArguments("--no-sandbox");
             options.addArguments("--disable-blink-features=AutomationControlled");
             options.setExperimentalOption("excludeSwitches", new String[]{"enable-automation"});
             options.setExperimentalOption("useAutomationExtension", false);
-            options.addArguments("user-agent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1");
+            // Mac Chrome User-Agent matching the headless chrome engine
+            options.addArguments("user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
+            options.addArguments("--window-size=1920,1080");
+            options.addArguments("--lang=tr-TR");
 
             driver = new ChromeDriver(options);
             driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(20));
@@ -37,6 +63,15 @@ public class PriceScraper {
 
             driver.get(url);
             Thread.sleep(5000); 
+
+            System.out.println("[Debug] Selenium Title: " + driver.getTitle());
+            String source = driver.getPageSource();
+            System.out.println("[Debug] Selenium Page Source Length: " + source.length());
+            if (source.length() > 500) {
+                System.out.println("[Debug] Selenium Page Source (Start): " + source.substring(0, 500));
+            } else {
+                System.out.println("[Debug] Selenium Page Source: " + source);
+            }
 
             dismissOverlays(driver);
 
@@ -65,7 +100,7 @@ public class PriceScraper {
         try {
             // H&M ve benzerleri için daha güçlü headerlar
             org.jsoup.nodes.Document doc = org.jsoup.Jsoup.connect(url)
-                .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+                .userAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
                 .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
                 .header("Accept-Language", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7")
                 .header("Cache-Control", "no-cache")
@@ -73,7 +108,30 @@ public class PriceScraper {
                 .timeout(15000)
                 .get();
 
-            // 1. Meta Tagları Kontrol Et (Daha geniş kapsam)
+            // 1. Trendyol Özel Taraması (Meta etiketlerinden önce yapılmalı ki sepetteki/indirimli fiyatı doğru çekelim)
+            if (url.contains("trendyol.com")) {
+                org.jsoup.select.Elements scriptTags = doc.select("script");
+                for (org.jsoup.nodes.Element s : scriptTags) {
+                    String data = s.data();
+                    if (data.contains("__PRODUCT_DETAIL_APP_INITIAL_STATE__") || data.contains("window.__INITIAL_STATE__")) {
+                        String[] regexes = {
+                            "\"sellingPrice\"\\s*:\\s*\\{\\s*\"value\"\\s*:\\s*([\\d\\.]+)",
+                            "\"sellingPrice\"\\s*:\\s*\\{\\s*\"amount\"\\s*:\\s*([\\d\\.]+)",
+                            "\"discountedPrice\"\\s*:\\s*\\{\\s*\"value\"\\s*:\\s*([\\d\\.]+)",
+                            "\"sellingPrice\"\\s*:\\s*([\\d\\.]+)"
+                        };
+                        for (String r : regexes) {
+                            java.util.regex.Matcher m = java.util.regex.Pattern.compile(r).matcher(data);
+                            if (m.find()) {
+                                System.out.println("[Debug] Jsoup found Trendyol Initial State Price: " + m.group(1));
+                                return m.group(1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Meta Tagları Kontrol Et (Daha geniş kapsam)
             String[] metaProps = {
                 "product:price:amount", "og:price:amount", "twitter:data1", "price",
                 "priceCurrency", "schema:price"
@@ -87,7 +145,18 @@ public class PriceScraper {
                 }
             }
 
-            // 2. LD+JSON Kontrol Et
+            // 3. itemprop="price" Kontrol Et
+            org.jsoup.select.Elements itempropPrices = doc.select("[itemprop=price]");
+            if (!itempropPrices.isEmpty()) {
+                String price = itempropPrices.first().attr("content");
+                if (price.isEmpty()) price = itempropPrices.first().text();
+                if (!price.isEmpty()) {
+                    System.out.println("[Debug] Jsoup found itemprop=price: " + price);
+                    return price;
+                }
+            }
+
+            // 4. LD+JSON Kontrol Et
             org.jsoup.select.Elements scripts = doc.select("script[type=application/ld+json]");
             for (org.jsoup.nodes.Element script : scripts) {
                 String content = script.data();
@@ -96,14 +165,21 @@ public class PriceScraper {
                     if (m.find()) return m.group(1).replace(",", ".");
                 }
             }
-            
-            // 3. Trendyol'a özel window.__INITIAL_STATE__ taraması
-            if (url.contains("trendyol.com")) {
-                org.jsoup.select.Elements scriptTags = doc.select("script");
-                for (org.jsoup.nodes.Element s : scriptTags) {
-                    if (s.data().contains("window.__INITIAL_STATE__")) {
-                        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"sellingPrice\"\\s*:\\s*([\\d\\.]+)").matcher(s.data());
-                        if (m.find()) return m.group(1);
+
+            // 5. __NEXT_DATA__ Kontrol Et (H&M ve modern siteler için)
+            org.jsoup.select.Elements nextDataScripts = doc.select("script#__NEXT_DATA__");
+            for (org.jsoup.nodes.Element script : nextDataScripts) {
+                String content = script.data();
+                String[] pricePatterns = {
+                    "\"price\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?",
+                    "\"priceValue\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?",
+                    "\"whitePrice\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?"
+                };
+                for (String pat : pricePatterns) {
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile(pat).matcher(content);
+                    if (m.find()) {
+                        System.out.println("[Debug] Jsoup found __NEXT_DATA__ Price: " + m.group(1));
+                        return m.group(1);
                     }
                 }
             }
@@ -132,7 +208,15 @@ public class PriceScraper {
 
     private String extractFromMetadata(WebDriver driver) {
         try {
-            // LD+JSON Taraması
+            // 1. itemprop="price" Taraması
+            try {
+                WebElement itempropPrice = driver.findElement(By.xpath("//*[@itemprop='price']"));
+                String val = itempropPrice.getAttribute("content");
+                if (val == null || val.isEmpty()) val = itempropPrice.getText().trim();
+                if (val != null && !val.isEmpty()) return val;
+            } catch (Exception ignored) {}
+
+            // 2. LD+JSON Taraması
             List<WebElement> scripts = driver.findElements(By.xpath("//script[@type='application/ld+json']"));
             for (WebElement script : scripts) {
                 String content = script.getAttribute("innerHTML");
@@ -166,8 +250,29 @@ public class PriceScraper {
                 }
             } else if (url.contains("hm.com")) {
                 // H&M için doğrudan fiyat alanı
-                List<WebElement> hmPrice = driver.findElements(By.cssSelector(".price-value, .primary-price, [data-test-id='product-price']"));
-                if (!hmPrice.isEmpty()) return hmPrice.get(0).getText().trim();
+                List<WebElement> hmPrice = driver.findElements(By.cssSelector(
+                    "[itemprop='price'], .price-value, .primary-price, [data-test-id='product-price'], .price.selling"
+                ));
+                for (WebElement el : hmPrice) {
+                    String val = el.getAttribute("content");
+                    if (val == null || val.isEmpty()) val = el.getText().trim();
+                    if (val != null && !val.isEmpty()) return val;
+                }
+                
+                // __NEXT_DATA__ üzerinden yedek plan
+                try {
+                    WebElement nextData = driver.findElement(By.id("__NEXT_DATA__"));
+                    String content = nextData.getAttribute("innerHTML");
+                    String[] pricePatterns = {
+                        "\"price\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?",
+                        "\"priceValue\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?",
+                        "\"whitePrice\"\\s*:\\s*\"?([\\d\\.\\,]+)\"?"
+                    };
+                    for (String pat : pricePatterns) {
+                        java.util.regex.Matcher m = java.util.regex.Pattern.compile(pat).matcher(content);
+                        if (m.find()) return m.group(1);
+                    }
+                } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {}
         return null;
@@ -224,6 +329,46 @@ public class PriceScraper {
             }
             if (bestElement != null) return bestElement.getText().trim();
         } catch (Exception ignored) {}
-        return null;
+    }
+
+    private void patchChromeDriver(File original, File patched) throws IOException {
+        byte[] bytes = Files.readAllBytes(original.toPath());
+        byte[] target = "cdc_".getBytes(StandardCharsets.US_ASCII);
+        int count = 0;
+        for (int i = 0; i < bytes.length - 30; i++) {
+            boolean match = true;
+            for (int j = 0; j < target.length; j++) {
+                if (bytes[i + j] != target[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                // Change "cdc_" to "abc_" and subsequent characters to "x"
+                bytes[i] = 'a';
+                bytes[i + 1] = 'b';
+                bytes[i + 2] = 'c';
+                for (int k = 4; k < 27; k++) {
+                    byte b = bytes[i + k];
+                    if ((b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_') {
+                        bytes[i + k] = 'x';
+                    }
+                }
+                count++;
+            }
+        }
+        System.out.println("[Debug] Patched " + count + " occurrences of cdc_ in chromedriver");
+        Files.write(patched.toPath(), bytes);
+        patched.setExecutable(true);
+
+        if (System.getProperty("os.name").toLowerCase().contains("mac")) {
+            try {
+                Process p = Runtime.getRuntime().exec(new String[]{"codesign", "--force", "--sign", "-", patched.getAbsolutePath()});
+                p.waitFor();
+                System.out.println("[Debug] Successfully codesigned patched chromedriver");
+            } catch (Exception e) {
+                System.out.println("[Debug] Failed to codesign chromedriver: " + e.getMessage());
+            }
+        }
     }
 }
